@@ -27,6 +27,11 @@ WRITES = re.compile(
 )
 
 
+def click_only():
+    """JEV_CLICK_ONLY keeps the run on Jev alone: no operation that needs the text helper."""
+    return os.environ.get("JEV_CLICK_ONLY", "").strip() in {"1", "true", "yes", "on"}
+
+
 class Blocked(RuntimeError):
     """A guard refused the action. The run stops; nothing was executed."""
 

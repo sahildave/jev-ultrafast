@@ -7,21 +7,27 @@ import time
 
 import httpx
 
-from .guards import BUDGET
+from .guards import BUDGET, Blocked, click_only
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
+# The Gateway free tier answers 429 for tens of seconds, not the ~1s the original
+# backoff assumed, so a browser run died two steps in. Tunable for paid accounts.
+RETRIES = int(os.environ.get("JEV_RETRIES", "5"))
+RETRY_BASE_SECONDS = float(os.environ.get("JEV_RETRY_BASE_SECONDS", "2"))
+
+
 def post_json(url, key, body, extra_headers=None):
-    for attempt in range(3):
+    for attempt in range(RETRIES):
         try:
             headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
             response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
-        if response.status_code in {429, 529, 503} and attempt < 2:
-            time.sleep(0.5 * 2**attempt)
+        if response.status_code in {429, 529, 503} and attempt < RETRIES - 1:
+            time.sleep(RETRY_BASE_SECONDS * 2**attempt)
             continue
         if response.is_error:
             # A bare status code hides the one thing that tells you what to do next -- a free-tier
@@ -122,7 +128,12 @@ def action_space(actions):
 
 
 def choose(state, goal, history):
-    elements, targets, controls = action_space(state["actions"])
+    actions = state["actions"]
+    if click_only():
+        # Withholding the targets is what keeps this honest: an unoffered head cannot be chosen,
+        # so the policy never reaches a TYPE_TEXT it would need a second model to complete.
+        actions = [a for a in actions if a["kind"] not in {"fill", "select"}]
+    elements, targets, controls = action_space(actions)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -205,6 +216,8 @@ def field_context(goal, action, page, history):
 
 
 def field_text(context):
+    if click_only():
+        raise Blocked("JEV_CLICK_ONLY is set; refusing to call the text helper model.")
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     key = os.environ.get("TEXT_MODEL_API_KEY", "").strip()
     if not key and "ai-gateway.vercel.sh" in base:

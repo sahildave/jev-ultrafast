@@ -2,7 +2,7 @@
 
 import pytest
 
-from jev_ultrafast import guards
+from jev_ultrafast import guards, model
 from jev_ultrafast.guards import Blocked, Budget, check_action
 
 
@@ -83,3 +83,37 @@ def test_the_agent_checks_every_action_before_executing_it():
     with open(source) as handle:
         body = handle.read()
     assert body.index("check_action(action)") < body.index('state["browser"].act(')
+
+
+def test_click_only_withholds_the_text_and_select_heads(monkeypatch):
+    """An unoffered operation cannot be chosen, so the run can never need a second model."""
+    monkeypatch.setenv("JEV_CLICK_ONLY", "1")
+    captured = {}
+
+    def fake_post(_url, _key, body, _headers=None):
+        captured["questions"] = body["questions"]
+        return {"answers": {"operation": {"type": "choice", "choice": "DONE",
+                                          "probabilities": {"CLICK": 0.0, "DONE": 1.0, "BLOCKED": 0.0},
+                                          "confidence": 1.0}}}
+
+    monkeypatch.setattr(model, "post_json", fake_post)
+    state = {
+        "url": "u", "title": "t", "text": "x",
+        "actions": [
+            {"kind": "click", "id": "c1", "node": 1, "role": "link", "label": "Roadmap"},
+            {"kind": "fill", "id": "f1", "node": 2, "role": "textbox", "label": "Repository"},
+            {"kind": "select", "id": "s1", "node": 3, "role": "combobox", "label": "Sort", "value": "new"},
+        ],
+    }
+    model.choose(state, "look around", [])
+    operations = captured["questions"]["operation"]["criteria"]
+    assert "TYPE_TEXT" not in operations and "SELECT" not in operations
+    assert "type_text_target" not in captured["questions"]
+    assert "CLICK" in operations
+
+
+def test_click_only_refuses_the_text_helper_outright(monkeypatch):
+    monkeypatch.setenv("JEV_CLICK_ONLY", "1")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "would-have-worked")
+    with pytest.raises(Blocked, match="refusing to call the text helper"):
+        model.field_text({"goal": "g"})
