@@ -9,7 +9,7 @@ import time
 
 import httpx
 
-from .guards import BUDGET, Blocked, click_only
+from .guards import BUDGET, GATEWAY_FREE_THROUGH, Blocked, click_only, gateway_still_free, paid_gateway_allowed
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -86,6 +86,18 @@ def decision_route(body):
     # ambient TYPESAFE_API_KEY, so without this a missing Gateway key bills the paid route.
     route = os.environ.get("JEV_ROUTE", "auto").strip()
     key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
+    if key and not gateway_still_free() and not paid_gateway_allowed():
+        # The promotion ends on a date, but the key keeps working and the bill starts
+        # quietly. Refuse the Gateway rather than let that happen unnoticed.
+        direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
+        if route == "gateway" or not direct:
+            raise Blocked(
+                "The Vercel Gateway promotion for Jev ended after "
+                f"{os.environ.get('JEV_GATEWAY_FREE_THROUGH', GATEWAY_FREE_THROUGH)}. "
+                "Set JEV_ALLOW_PAID_GATEWAY=1 to pay for it, or set TYPESAFE_API_KEY with "
+                "JEV_ROUTE=auto to fall back to the direct API."
+            )
+        key = ""  # fall through to the direct route below
     if route == "gateway" and not key:
         raise RuntimeError("JEV_ROUTE=gateway but AI_GATEWAY_API_KEY is empty; refusing the billed direct API.")
     if not key:

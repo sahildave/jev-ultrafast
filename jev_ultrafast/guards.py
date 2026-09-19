@@ -6,6 +6,7 @@ guards refuse the action instead of trusting the choice, and stop the run when t
 Gateway's own cost accounting passes a budget.
 """
 
+import datetime
 import os
 import re
 
@@ -30,6 +31,23 @@ WRITES = re.compile(
 def click_only():
     """JEV_CLICK_ONLY keeps the run on Jev alone: no operation that needs the text helper."""
     return os.environ.get("JEV_CLICK_ONLY", "").strip() in {"1", "true", "yes", "on"}
+
+
+# Jev is free on the Gateway as a promotion, not as a price. Vercel announced it through
+# 24 Sept 2026; after that the same call starts costing money on the same key, silently.
+GATEWAY_FREE_THROUGH = "2026-09-24"
+
+
+def gateway_still_free(today=None):
+    through = os.environ.get("JEV_GATEWAY_FREE_THROUGH", GATEWAY_FREE_THROUGH).strip()
+    if through.lower() in {"", "never", "off"}:
+        return True
+    today = today or datetime.date.today()
+    return today <= datetime.date.fromisoformat(through)
+
+
+def paid_gateway_allowed():
+    return os.environ.get("JEV_ALLOW_PAID_GATEWAY", "").strip() in {"1", "true", "yes", "on"}
 
 
 class Blocked(RuntimeError):
@@ -58,6 +76,10 @@ def check_action(action):
         raise Blocked(f"Guard refused {action['kind']} on {action['label']!r}: writes in readonly mode.")
 
 
+def require_free():
+    return os.environ.get("JEV_REQUIRE_FREE", "").strip() in {"1", "true", "yes", "on"}
+
+
 class Budget:
     """Cumulative spend for one run, read from the Gateway's own cost accounting."""
 
@@ -70,6 +92,7 @@ class Budget:
         return float(os.environ.get("JEV_MAX_COST_USD", "0.25"))
 
     def record(self, response, label):
+        """The date is the announcement; this is the truth. A promo ending early trips here first."""
         cost = response.get("providerMetadata", {}).get("gateway", {}).get("cost")
         if cost is None:
             message = response.get("choices", [{}])[0].get("message", {})
@@ -77,6 +100,11 @@ class Budget:
         amount = float(cost or 0)
         self.spent += amount
         self.calls.append({"label": label, "cost": amount})
+        if amount and require_free():
+            raise Blocked(
+                f"JEV_REQUIRE_FREE is set but the {label} call cost ${amount:.8f}. "
+                "The Gateway promotion has ended or this model was never free."
+            )
         if self.spent > self.limit:
             raise Blocked(f"Run spent ${self.spent:.6f}, over the ${self.limit:.2f} JEV_MAX_COST_USD budget.")
         return amount
