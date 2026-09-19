@@ -1,0 +1,85 @@
+"""Offline contracts for the action and budget guards. No paid APIs."""
+
+import pytest
+
+from jev_ultrafast import guards
+from jev_ultrafast.guards import Blocked, Budget, check_action
+
+
+def act(label, kind="click", **extra):
+    return {"kind": kind, "id": "a1", "label": label, **extra}
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Delete board", "Sign in with GitHub", "Continue with Google", "Subscribe", "Checkout", "Revoke access"],
+)
+def test_irreversible_auth_and_billing_are_refused_even_in_write_mode(label, monkeypatch):
+    monkeypatch.setenv("JEV_GUARD", "write")
+    with pytest.raises(Blocked, match="irreversible, auth, or billing"):
+        check_action(act(label))
+
+
+@pytest.mark.parametrize("label", ["Post comment", "Upvote", "Create issue", "Submit feedback"])
+def test_writes_are_refused_in_the_default_readonly_mode(label, monkeypatch):
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked, match="writes in readonly mode"):
+        check_action(act(label))
+
+
+@pytest.mark.parametrize("label", ["Post comment", "Upvote"])
+def test_write_mode_allows_writes(label, monkeypatch):
+    monkeypatch.setenv("JEV_GUARD", "write")
+    check_action(act(label))
+
+
+@pytest.mark.parametrize("label", ["Roadmap", "Changelog", "Open a board for a repository", "Search"])
+def test_navigation_and_search_stay_allowed(label, monkeypatch):
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    check_action(act(label))
+    check_action(act(label, kind="fill"))
+
+
+def test_a_guarded_label_hiding_in_the_field_value_is_still_caught(monkeypatch):
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked):
+        check_action(act("Confirm", current_value="delete this board"))
+
+
+def test_off_disables_both_guards(monkeypatch):
+    monkeypatch.setenv("JEV_GUARD", "off")
+    check_action(act("Delete board"))
+
+
+def test_budget_sums_the_gateway_cost_and_stops_the_run(monkeypatch):
+    monkeypatch.setenv("JEV_MAX_COST_USD", "0.001")
+    budget = Budget()
+    decision = {"providerMetadata": {"gateway": {"cost": "0.0004"}}}
+    assert budget.record(decision, "decision") == 0.0004
+    budget.record(decision, "decision")
+    with pytest.raises(Blocked, match="over the .0.00 JEV_MAX_COST_USD budget"):
+        budget.record(decision, "decision")
+    assert budget.spent == pytest.approx(0.0012)
+
+
+def test_budget_reads_the_text_helper_cost_from_its_own_envelope(monkeypatch):
+    monkeypatch.setenv("JEV_MAX_COST_USD", "1")
+    budget = Budget()
+    text = {"choices": [{"message": {"provider_metadata": {"gateway": {"cost": "0.00002062"}}}}]}
+    assert budget.record(text, "text") == pytest.approx(0.00002062)
+
+
+def test_a_free_model_reporting_zero_never_trips_the_budget(monkeypatch):
+    monkeypatch.setenv("JEV_MAX_COST_USD", "0")
+    budget = Budget()
+    for _ in range(50):
+        budget.record({"providerMetadata": {"gateway": {"cost": "0"}}}, "decision")
+    assert budget.spent == 0
+
+
+def test_the_agent_checks_every_action_before_executing_it():
+    """The guard must sit before Browser.act, not after; a refusal that runs first is not a guard."""
+    source = (guards.__file__.replace("guards.py", "agent.py"))
+    with open(source) as handle:
+        body = handle.read()
+    assert body.index("check_action(action)") < body.index('state["browser"].act(')

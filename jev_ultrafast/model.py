@@ -7,6 +7,7 @@ import time
 
 import httpx
 
+from .guards import BUDGET
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -23,7 +24,14 @@ def post_json(url, key, body, extra_headers=None):
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+            # A bare status code hides the one thing that tells you what to do next -- a free-tier
+            # rate limit and an expired key both read as "HTTP 429" / "HTTP 401" otherwise.
+            try:
+                detail = response.json().get("error", {}).get("message", "")
+            except ValueError:
+                detail = ""
+            detail = f" {detail}" if detail else ""
+            raise RuntimeError(f"Model provider returned HTTP {response.status_code};{detail} no action executed.")
         return response.json()
     raise RuntimeError("Model unavailable")
 
@@ -152,6 +160,7 @@ def choose(state, goal, history):
     }
     started = time.perf_counter()
     result = post_json(*decision_route(body))
+    BUDGET.record(result, "decision")
     for question, value in result.get("providerMetadata", {}).get("typesafe", {}).get("confidence", {}).items():
         if question in result.get("answers", {}):
             result["answers"][question]["confidence"] = value
@@ -196,10 +205,13 @@ def field_context(goal, action, page, history):
 
 
 def field_text(context):
-    key = os.environ.get("TEXT_MODEL_API_KEY")
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    key = os.environ.get("TEXT_MODEL_API_KEY", "").strip()
+    if not key and "ai-gateway.vercel.sh" in base:
+        # One Gateway key serves both heads; no reason to paste the same secret twice.
+        key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
     if not key:
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     model = os.environ.get("TEXT_MODEL", "deepseek-chat")
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
@@ -222,6 +234,7 @@ def field_text(context):
             ],
         },
     )
+    BUDGET.record(result, "text")
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
         value = output["text"]

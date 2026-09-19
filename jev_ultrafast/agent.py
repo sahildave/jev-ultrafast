@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
+from .guards import check_action
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
@@ -99,6 +100,7 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
+            check_action(action)
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
