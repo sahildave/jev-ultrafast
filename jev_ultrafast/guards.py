@@ -40,10 +40,16 @@ def mode():
     return os.environ.get("JEV_GUARD", "readonly").strip().lower()
 
 
+# Only these reach the page. WAIT, SCROLL_UP and SCROLL_DOWN are Jev's own controls and
+# carry descriptive labels -- "Wait for the page to update" matched the write pattern on
+# the word "update" and blocked a run that had touched nothing.
+PAGE_ACTIONS = {"click", "fill", "select"}
+
+
 def check_action(action):
     """Raise before Browser.act() touches the page. Navigation and typing stay allowed."""
     current = mode()
-    if current == "off":
+    if current == "off" or action["kind"] not in PAGE_ACTIONS:
         return
     label = " ".join(str(action.get(k, "") or "") for k in ("label", "value", "current_value"))
     if FORBIDDEN.search(label):

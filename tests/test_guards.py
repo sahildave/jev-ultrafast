@@ -46,6 +46,13 @@ def test_a_guarded_label_hiding_in_the_field_value_is_still_caught(monkeypatch):
         check_action(act("Confirm", current_value="delete this board"))
 
 
+@pytest.mark.parametrize("kind", ["wait", "scroll_down", "scroll_up"])
+def test_jevs_own_controls_are_never_guarded(kind, monkeypatch):
+    """'Wait for the page to update' matched the write pattern and blocked a clean run."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    check_action(act("Wait for the page to update", kind=kind))
+
+
 def test_off_disables_both_guards(monkeypatch):
     monkeypatch.setenv("JEV_GUARD", "off")
     check_action(act("Delete board"))
