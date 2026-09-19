@@ -12,10 +12,11 @@ from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, extra_headers=None):
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
+            response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -27,9 +28,43 @@ def post_json(url, key, body):
     raise RuntimeError("Model unavailable")
 
 
+GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v4/ai"
+GATEWAY_PROTOCOL_VERSION = "0.0.1"
+
+
+def decision_route(body):
+    """The Gateway carries the model id in a header and returns camelCase usage; the direct API does neither."""
+    # JEV_ROUTE=gateway forbids the direct API outright. An .env cannot blank out an
+    # ambient TYPESAFE_API_KEY, so without this a missing Gateway key bills the paid route.
+    route = os.environ.get("JEV_ROUTE", "auto").strip()
+    key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
+    if route == "gateway" and not key:
+        raise RuntimeError("JEV_ROUTE=gateway but AI_GATEWAY_API_KEY is empty; refusing the billed direct API.")
+    if not key:
+        direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
+        if not direct:
+            raise RuntimeError("Set AI_GATEWAY_API_KEY (Vercel AI Gateway) or TYPESAFE_API_KEY (direct API).")
+        return "https://api.typesafe.ai/v1/systemone", direct, body, None
+    # TYPESAFE_MODEL holds a direct-API id such as jev-latest; the Gateway wants its own slug.
+    model = os.environ.get("GATEWAY_MODEL", "typesafe-ai/jev")
+    headers = {
+        "ai-gateway-protocol-version": GATEWAY_PROTOCOL_VERSION,
+        "ai-gateway-auth-method": "api-key",
+        "ai-evaluation-model-specification-version": "4",
+        "ai-model-id": model,
+    }
+    return GATEWAY_BASE_URL + "/evaluation-model", key, {k: v for k, v in body.items() if k != "model"}, headers
+
+
+def normalise_usage(usage):
+    renamed = {"inputTokens": "input_tokens", "outputTokens": "output_tokens"}
+    return {renamed.get(k, k): v for k, v in (usage or {}).items()}
+
+
 def validate_choice(answer, ids):
     try:
         probabilities = answer["probabilities"]
+        answer.setdefault("confidence", max(probabilities.values(), default=0))
         numbers = [*probabilities.values(), answer["confidence"]]
         valid = (
             answer["choice"] in ids
@@ -116,7 +151,10 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result = post_json(*decision_route(body))
+    for question, value in result.get("providerMetadata", {}).get("typesafe", {}).get("confidence", {}).items():
+        if question in result.get("answers", {}):
+            result["answers"][question]["confidence"] = value
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -141,8 +179,8 @@ def choose(state, goal, history):
         "target_probabilities": target_answer["probabilities"] if target_answer else {},
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "raw_answers": result["answers"],
-        "model": result["model"],
-        "usage": result.get("usage", {}),
+        "model": result.get("model") or os.environ.get("GATEWAY_MODEL", "typesafe-ai/jev"),
+        "usage": normalise_usage(result.get("usage")),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,
     }
