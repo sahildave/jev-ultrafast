@@ -117,3 +117,23 @@ def test_click_only_refuses_the_text_helper_outright(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "would-have-worked")
     with pytest.raises(Blocked, match="refusing to call the text helper"):
         model.field_text({"goal": "g"})
+
+
+def test_pacing_spaces_consecutive_requests(monkeypatch):
+    """The gap must sit on every request; two decisions inside one task are milliseconds apart."""
+    slept = []
+    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(model, "_last_request_at", None)
+    monkeypatch.setattr(model.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(model.time, "sleep", slept.append)
+    model.pace()
+    assert slept == [], "the first request is not delayed"
+    monkeypatch.setattr(model, "_last_request_at", 10.0)
+    model.pace()
+    assert slept == [60.0], f"a request 0s after the last must wait the full gap, got {slept}"
+
+
+def test_pacing_is_off_by_default(monkeypatch):
+    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(model.time, "sleep", lambda _s: pytest.fail("paced with no interval set"))
+    model.pace()
