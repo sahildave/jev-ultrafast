@@ -11,7 +11,8 @@ def test_without_a_gateway_key_the_direct_api_keeps_the_model_in_the_body(monkey
     monkeypatch.delenv("AI_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("JEV_ROUTE", raising=False)
     monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key")
-    url, key, body, headers = model.decision_route(dict(BODY))
+    leg = model.decision_legs(dict(BODY))[0]
+    url, key, body, headers = leg["url"], leg["key"], leg["body"], leg["headers"]
     assert url == "https://api.typesafe.ai/v1/systemone"
     assert (key, body["model"], headers) == ("ts-key", "jev-latest", None)
 
@@ -19,7 +20,8 @@ def test_without_a_gateway_key_the_direct_api_keeps_the_model_in_the_body(monkey
 def test_a_gateway_key_moves_the_model_id_into_the_headers(monkeypatch):
     monkeypatch.setenv("AI_GATEWAY_API_KEY", "gw-key")
     monkeypatch.delenv("GATEWAY_MODEL", raising=False)
-    url, key, body, headers = model.decision_route(dict(BODY))
+    leg = model.decision_legs(dict(BODY))[0]
+    url, key, body, headers = leg["url"], leg["key"], leg["body"], leg["headers"]
     assert url == "https://ai-gateway.vercel.sh/v4/ai/evaluation-model"
     assert key == "gw-key"
     assert set(body) == {"state", "questions"}, "the Gateway rejects a model key in the body"
@@ -35,8 +37,8 @@ def test_route_gateway_refuses_to_fall_back_to_the_billed_api(monkeypatch):
     monkeypatch.setenv("JEV_ROUTE", "gateway")
     monkeypatch.setenv("AI_GATEWAY_API_KEY", "")
     monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key-that-must-not-be-used")
-    with pytest.raises(RuntimeError, match="refusing the billed direct API"):
-        model.decision_route(dict(BODY))
+    with pytest.raises(Exception, match="Refusing to bill the direct API"):
+        model.decision_legs(dict(BODY))
 
 
 def test_a_gateway_answer_without_confidence_still_validates():

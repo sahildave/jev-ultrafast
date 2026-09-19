@@ -9,10 +9,26 @@ import time
 
 import httpx
 
-from .guards import BUDGET, GATEWAY_FREE_THROUGH, Blocked, click_only, gateway_still_free, paid_gateway_allowed
+from .guards import (
+    BUDGET,
+    GATEWAY_FREE_THROUGH,
+    Blocked,
+    click_only,
+    gateway_still_free,
+    paid_gateway_allowed,
+    require_free,
+)
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+
+
+class ProviderError(RuntimeError):
+    """A provider answered with an error. status carries the code so a leg can be retired."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 # The Gateway free tier answers 429 for tens of seconds, not the ~1s the original
@@ -52,15 +68,16 @@ def pace():
         pass
 
 
-def post_json(url, key, body, extra_headers=None):
+def post_json(url, key, body, extra_headers=None, retries=None):
     pace()
-    for attempt in range(RETRIES):
+    retries = RETRIES if retries is None else retries
+    for attempt in range(retries):
         try:
             headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
             response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
-            raise RuntimeError("Model connection failed; no action executed.") from None
-        if response.status_code in {429, 529, 503} and attempt < RETRIES - 1:
+            raise ProviderError("Model connection failed; no action executed.", None) from None
+        if response.status_code in {429, 529, 503} and attempt < retries - 1:
             time.sleep(RETRY_BASE_SECONDS * 2**attempt)
             continue
         if response.is_error:
@@ -71,7 +88,10 @@ def post_json(url, key, body, extra_headers=None):
             except ValueError:
                 detail = ""
             detail = f" {detail}" if detail else ""
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code};{detail} no action executed.")
+            raise ProviderError(
+                f"Model provider returned HTTP {response.status_code};{detail} no action executed.",
+                response.status_code,
+            )
         return response.json()
     raise RuntimeError("Model unavailable")
 
@@ -80,40 +100,68 @@ GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v4/ai"
 GATEWAY_PROTOCOL_VERSION = "0.0.1"
 
 
-def decision_route(body):
-    """The Gateway carries the model id in a header and returns camelCase usage; the direct API does neither."""
-    # JEV_ROUTE=gateway forbids the direct API outright. An .env cannot blank out an
-    # ambient TYPESAFE_API_KEY, so without this a missing Gateway key bills the paid route.
-    route = os.environ.get("JEV_ROUTE", "auto").strip()
+def _gateway_leg(body):
     key = os.environ.get("AI_GATEWAY_API_KEY", "").strip()
-    if key and not gateway_still_free() and not paid_gateway_allowed():
-        # The promotion ends on a date, but the key keeps working and the bill starts
-        # quietly. Refuse the Gateway rather than let that happen unnoticed.
-        direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
-        if route == "gateway" or not direct:
-            raise Blocked(
-                "The Vercel Gateway promotion for Jev ended after "
-                f"{os.environ.get('JEV_GATEWAY_FREE_THROUGH', GATEWAY_FREE_THROUGH)}. "
-                "Set JEV_ALLOW_PAID_GATEWAY=1 to pay for it, or set TYPESAFE_API_KEY with "
-                "JEV_ROUTE=auto to fall back to the direct API."
-            )
-        key = ""  # fall through to the direct route below
-    if route == "gateway" and not key:
-        raise RuntimeError("JEV_ROUTE=gateway but AI_GATEWAY_API_KEY is empty; refusing the billed direct API.")
     if not key:
-        direct = os.environ.get("TYPESAFE_API_KEY", "").strip()
-        if not direct:
-            raise RuntimeError("Set AI_GATEWAY_API_KEY (Vercel AI Gateway) or TYPESAFE_API_KEY (direct API).")
-        return "https://api.typesafe.ai/v1/systemone", direct, body, None
-    # TYPESAFE_MODEL holds a direct-API id such as jev-latest; the Gateway wants its own slug.
+        return None
+    if not gateway_still_free() and not paid_gateway_allowed():
+        return None
     model = os.environ.get("GATEWAY_MODEL", "typesafe-ai/jev")
-    headers = {
-        "ai-gateway-protocol-version": GATEWAY_PROTOCOL_VERSION,
-        "ai-gateway-auth-method": "api-key",
-        "ai-evaluation-model-specification-version": "4",
-        "ai-model-id": model,
+    return {
+        "name": "gateway",
+        "url": GATEWAY_BASE_URL + "/evaluation-model",
+        "key": key,
+        # TYPESAFE_MODEL holds a direct-API id such as jev-latest; the Gateway wants its own slug.
+        "body": {k: v for k, v in body.items() if k != "model"},
+        "headers": {
+            "ai-gateway-protocol-version": GATEWAY_PROTOCOL_VERSION,
+            "ai-gateway-auth-method": "api-key",
+            "ai-evaluation-model-specification-version": "4",
+            "ai-model-id": model,
+        },
     }
-    return GATEWAY_BASE_URL + "/evaluation-model", key, {k: v for k, v in body.items() if k != "model"}, headers
+
+
+def _direct_leg(body):
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if not key:
+        return None
+    return {"name": "direct", "url": "https://api.typesafe.ai/v1/systemone", "key": key,
+            "body": body, "headers": None}
+
+
+def decision_legs(body):
+    """Legs to try in order. Measured: the Gateway answers in ~0.57s against the direct
+    API's ~0.87s, but only for a burst before the free tier throttles. Free-and-fast
+    first, paid-and-reliable behind it, so a run neither stalls nor pays when it need not.
+    """
+    route = os.environ.get("JEV_ROUTE", "auto").strip()
+    gateway, direct = _gateway_leg(body), _direct_leg(body)
+
+    if route == "gateway":
+        if not gateway:
+            raise Blocked(
+                "JEV_ROUTE=gateway, but the Gateway leg is unavailable: either "
+                "AI_GATEWAY_API_KEY is empty, or the promotion ended after "
+                f"{os.environ.get('JEV_GATEWAY_FREE_THROUGH', GATEWAY_FREE_THROUGH)} and "
+                "JEV_ALLOW_PAID_GATEWAY is not set. Refusing to bill the direct API instead."
+            )
+        return [gateway]
+    if route == "direct":
+        if not direct:
+            raise Blocked("JEV_ROUTE=direct but TYPESAFE_API_KEY is empty.")
+        return [direct]
+
+    # JEV_REQUIRE_FREE means free, and the direct API is not. Failing over would bill
+    # the key the setting exists to protect.
+    legs = [leg for leg in (gateway, None if require_free() else direct) if leg]
+    if not legs:
+        raise Blocked(
+            "No usable route. Set AI_GATEWAY_API_KEY (free through "
+            f"{os.environ.get('JEV_GATEWAY_FREE_THROUGH', GATEWAY_FREE_THROUGH)}) "
+            "or TYPESAFE_API_KEY, and unset JEV_REQUIRE_FREE to allow the paid fallback."
+        )
+    return legs
 
 
 def normalise_usage(usage):
@@ -173,6 +221,29 @@ def action_space(actions):
     return elements, targets, controls
 
 
+FAILOVER_STATUSES = {429, 500, 502, 503, 529, None}
+
+
+def post_decision(body):
+    """Walk the legs, retiring one only for a limit or an outage. A 400 is our bug on
+    every leg, so failing over would just spend a second provider to learn the same thing.
+    """
+    legs = decision_legs(body)
+    last = None
+    for index, leg in enumerate(legs):
+        # Backing off on a leg that has another behind it is 30s spent to reach the same
+        # failover. Only the last leg, which has nowhere to go, is worth waiting on.
+        last_leg = index == len(legs) - 1
+        try:
+            return post_json(leg["url"], leg["key"], leg["body"], leg["headers"],
+                             retries=None if last_leg else 1), leg["name"]
+        except ProviderError as error:
+            if error.status not in FAILOVER_STATUSES or last_leg:
+                raise
+            last = error
+    raise last
+
+
 def choose(state, goal, history):
     actions = state["actions"]
     if click_only():
@@ -216,8 +287,11 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json(*decision_route(body))
-    BUDGET.record(result, "decision")
+    result, leg = post_decision(body)
+    if leg == "direct":
+        BUDGET.estimate(normalise_usage(result.get("usage")), "decision:direct")
+    else:
+        BUDGET.record(result, f"decision:{leg}")
     for question, value in result.get("providerMetadata", {}).get("typesafe", {}).get("confidence", {}).items():
         if question in result.get("answers", {}):
             result["answers"][question]["confidence"] = value
@@ -246,6 +320,7 @@ def choose(state, goal, history):
         "target_confidence": target_answer["confidence"] if target_answer else None,
         "raw_answers": result["answers"],
         "model": result.get("model") or os.environ.get("GATEWAY_MODEL", "typesafe-ai/jev"),
+        "leg": leg,
         "usage": normalise_usage(result.get("usage")),
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "request": body,

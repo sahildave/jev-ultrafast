@@ -23,16 +23,17 @@ def test_the_promotion_window_is_a_date_not_a_guess():
     assert gateway_still_free(datetime.date(2026, 9, 25)) is False
 
 
-def test_after_the_promotion_the_gateway_is_refused(monkeypatch):
+def test_after_the_promotion_with_no_other_key_there_is_no_route(monkeypatch):
     monkeypatch.setenv("JEV_GATEWAY_FREE_THROUGH", "2020-01-01")
-    with pytest.raises(Blocked, match="promotion for Jev ended"):
-        model.decision_route(dict(BODY))
+    with pytest.raises(Blocked, match="No usable route"):
+        model.decision_legs(dict(BODY))
 
 
 def test_after_the_promotion_a_typesafe_key_takes_over(monkeypatch):
     monkeypatch.setenv("JEV_GATEWAY_FREE_THROUGH", "2020-01-01")
     monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key")
-    url, key, body, headers = model.decision_route(dict(BODY))
+    leg = model.decision_legs(dict(BODY))[0]
+    url, key, body, headers = leg["url"], leg["key"], leg["body"], leg["headers"]
     assert url == "https://api.typesafe.ai/v1/systemone"
     assert (key, headers, body["model"]) == ("ts-key", None, "jev-latest")
 
@@ -42,20 +43,21 @@ def test_route_gateway_does_not_silently_become_the_direct_api(monkeypatch):
     monkeypatch.setenv("JEV_GATEWAY_FREE_THROUGH", "2020-01-01")
     monkeypatch.setenv("JEV_ROUTE", "gateway")
     monkeypatch.setenv("TYPESAFE_API_KEY", "ts-key")
-    with pytest.raises(Blocked, match="promotion for Jev ended"):
-        model.decision_route(dict(BODY))
+    with pytest.raises(Blocked, match="Refusing to bill the direct API"):
+        model.decision_legs(dict(BODY))
 
 
 def test_paying_for_the_gateway_is_an_explicit_opt_in(monkeypatch):
     monkeypatch.setenv("JEV_GATEWAY_FREE_THROUGH", "2020-01-01")
     monkeypatch.setenv("JEV_ALLOW_PAID_GATEWAY", "1")
-    url, _key, _body, headers = model.decision_route(dict(BODY))
+    leg = model.decision_legs(dict(BODY))[0]
+    url, headers = leg["url"], leg["headers"]
     assert url.endswith("/evaluation-model") and headers["ai-model-id"] == "typesafe-ai/jev"
 
 
 def test_during_the_promotion_nothing_changes(monkeypatch):
     monkeypatch.setenv("JEV_GATEWAY_FREE_THROUGH", "2099-01-01")
-    url, _key, _body, _headers = model.decision_route(dict(BODY))
+    url = model.decision_legs(dict(BODY))[0]["url"]
     assert url.endswith("/evaluation-model")
 
 

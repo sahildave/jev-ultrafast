@@ -91,13 +91,16 @@ class Budget:
     def limit(self):
         return float(os.environ.get("JEV_MAX_COST_USD", "0.25"))
 
-    def record(self, response, label):
-        """The date is the announcement; this is the truth. A promo ending early trips here first."""
-        cost = response.get("providerMetadata", {}).get("gateway", {}).get("cost")
-        if cost is None:
-            message = response.get("choices", [{}])[0].get("message", {})
-            cost = message.get("provider_metadata", {}).get("gateway", {}).get("cost")
-        amount = float(cost or 0)
+    # The Gateway's listed market rate for typesafe-ai/jev. The direct API returns usage
+    # but no cost, so a mixed run would otherwise report only half its spend.
+    DIRECT_INPUT_USD_PER_TOKEN = 0.000000042
+
+    def estimate(self, usage, label):
+        """Charge a direct-API call at the published rate; it reports tokens, not money."""
+        tokens = (usage or {}).get("input_tokens") or 0
+        return self.charge(tokens * self.DIRECT_INPUT_USD_PER_TOKEN, label)
+
+    def charge(self, amount, label):
         self.spent += amount
         self.calls.append({"label": label, "cost": amount})
         if amount and require_free():
@@ -108,6 +111,14 @@ class Budget:
         if self.spent > self.limit:
             raise Blocked(f"Run spent ${self.spent:.6f}, over the ${self.limit:.2f} JEV_MAX_COST_USD budget.")
         return amount
+
+    def record(self, response, label):
+        """The date is the announcement; this is the truth. A promo ending early trips here first."""
+        cost = response.get("providerMetadata", {}).get("gateway", {}).get("cost")
+        if cost is None:
+            message = response.get("choices", [{}])[0].get("message", {})
+            cost = message.get("provider_metadata", {}).get("gateway", {}).get("cost")
+        return self.charge(float(cost or 0), label)
 
 
 BUDGET = Budget()

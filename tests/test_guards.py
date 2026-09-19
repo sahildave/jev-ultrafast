@@ -97,7 +97,7 @@ def test_click_only_withholds_the_text_and_select_heads(monkeypatch):
     monkeypatch.setenv("JEV_CLICK_ONLY", "1")
     captured = {}
 
-    def fake_post(_url, _key, body, _headers=None):
+    def fake_post(_url, _key, body, _headers=None, retries=None):
         captured["questions"] = body["questions"]
         return {"answers": {"operation": {"type": "choice", "choice": "DONE",
                                           "probabilities": {"CLICK": 0.0, "DONE": 1.0, "BLOCKED": 0.0},

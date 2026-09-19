@@ -77,7 +77,7 @@ def test_one_index_per_node_with_operation_specific_targets():
 def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     calls = []
 
-    def post(_url, _key, body, _headers=None):
+    def post(_url, _key, body, _headers=None, retries=None):
         calls.append(body)
         return {
             "model": "test",
@@ -97,7 +97,7 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
-    def post(_url, _key, body, _headers=None):
+    def post(_url, _key, body, _headers=None, retries=None):
         return {
             "model": "test",
             "answers": {
@@ -120,7 +120,7 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
         "role": "checkbox", "checked": "true", "selected": False,
     })
 
-    def post(_url, _key, body, _headers=None):
+    def post(_url, _key, body, _headers=None, retries=None):
         questions = body["questions"]
         target = questions["click_target"]
         assert target["criteria"]["1"]["checked"] == "true"
