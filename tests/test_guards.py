@@ -126,21 +126,34 @@ def test_click_only_refuses_the_text_helper_outright(monkeypatch):
         model.field_text({"goal": "g"})
 
 
-def test_pacing_spaces_consecutive_requests(monkeypatch):
+def test_pacing_spaces_consecutive_requests(tmp_path, monkeypatch):
     """The gap must sit on every request; two decisions inside one task are milliseconds apart."""
     slept = []
     monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(model, "_last_request_at", None)
-    monkeypatch.setattr(model.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
+    monkeypatch.setattr(model.time, "time", lambda: 1000.0)
     monkeypatch.setattr(model.time, "sleep", slept.append)
     model.pace()
     assert slept == [], "the first request is not delayed"
-    monkeypatch.setattr(model, "_last_request_at", 10.0)
     model.pace()
     assert slept == [60.0], f"a request 0s after the last must wait the full gap, got {slept}"
 
 
-def test_pacing_is_off_by_default(monkeypatch):
+def test_pacing_survives_a_fresh_process(tmp_path, monkeypatch):
+    """A rerun seconds later is a new interpreter; without this it walks back into the limit."""
+    slept = []
+    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 60.0)
+    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
+    monkeypatch.setattr(model.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(model.time, "sleep", slept.append)
+    model.pace()
+    (tmp_path / "last").write_text("995.0")  # a previous process, five seconds ago
+    model.pace()
+    assert slept == [55.0], f"expected the remainder of the gap, got {slept}"
+
+
+def test_pacing_is_off_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
     monkeypatch.setattr(model.time, "sleep", lambda _s: pytest.fail("paced with no interval set"))
     model.pace()

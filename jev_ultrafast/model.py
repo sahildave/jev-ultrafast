@@ -3,6 +3,8 @@
 import json
 import math
 import os
+import pathlib
+import tempfile
 import time
 
 import httpx
@@ -24,18 +26,30 @@ RETRY_BASE_SECONDS = float(os.environ.get("JEV_RETRY_BASE_SECONDS", "2"))
 # has to sit here rather than between tasks -- two decisions inside one task are
 # milliseconds apart, and that pair is what trips the free tier.
 MIN_INTERVAL_SECONDS = float(os.environ.get("JEV_MIN_INTERVAL_SECONDS", "0"))
-_last_request_at = None
+# The clock has to outlive the process. A rerun a few seconds after the last run is a
+# fresh interpreter with no memory of it, so in-process pacing fires immediately and
+# walks straight back into the limit -- which is exactly how the board retry died.
+PACE_FILE = pathlib.Path(os.environ.get("JEV_PACE_FILE", tempfile.gettempdir() + "/jev-last-request"))
+
+
+def _last_request_at():
+    try:
+        return float(PACE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def pace():
-    global _last_request_at
-    # None, not 0.0: time.monotonic() starts near zero on macOS, so a 0.0 sentinel would
-    # make the very first request of a run sleep for the whole interval.
-    if MIN_INTERVAL_SECONDS and _last_request_at is not None:
-        wait = _last_request_at + MIN_INTERVAL_SECONDS - time.monotonic()
+    if MIN_INTERVAL_SECONDS:
+        previous = _last_request_at()
+        # time.time(), not monotonic(): monotonic is meaningless across processes.
+        wait = 0 if previous is None else previous + MIN_INTERVAL_SECONDS - time.time()
         if wait > 0:
             time.sleep(wait)
-    _last_request_at = time.monotonic()
+    try:
+        PACE_FILE.write_text(str(time.time()))
+    except OSError:
+        pass
 
 
 def post_json(url, key, body, extra_headers=None):
