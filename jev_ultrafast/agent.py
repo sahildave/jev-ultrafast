@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .guards import check_action
+from .guards import BUDGET, check_action
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
@@ -16,6 +16,9 @@ class Agent:
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
+        # JEV_MAX_COST_USD is a per-run cap. The inspector builds a new Agent per run in
+        # one process, so without this the second run starts already spent.
+        BUDGET.reset()
         self.pending_text = None
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None

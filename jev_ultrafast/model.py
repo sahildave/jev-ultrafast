@@ -31,54 +31,74 @@ class ProviderError(RuntimeError):
         self.status = status
 
 
+def env_number(name, default, cast=float):
+    """Read at call time, not import time. demo.py loads .env AFTER importing this module,
+    so an import-time constant silently keeps its default for every `uv run jev` session.
+    """
+    try:
+        return cast(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return cast(default)
+
+
 # The Gateway free tier answers 429 for tens of seconds, not the ~1s the original
 # backoff assumed, so a browser run died two steps in. Tunable for paid accounts.
-RETRIES = int(os.environ.get("JEV_RETRIES", "5"))
-RETRY_BASE_SECONDS = float(os.environ.get("JEV_RETRY_BASE_SECONDS", "2"))
+def default_retries():
+    return env_number("JEV_RETRIES", "5", int)
+
+
+def retry_base_seconds():
+    return env_number("JEV_RETRY_BASE_SECONDS", "2")
 
 
 # Pacing beats backoff on a hard rate limit: spacing every request keeps the run under
 # the limit instead of discovering it, then waiting, then discovering it again. The gap
 # has to sit here rather than between tasks -- two decisions inside one task are
 # milliseconds apart, and that pair is what trips the free tier.
-MIN_INTERVAL_SECONDS = float(os.environ.get("JEV_MIN_INTERVAL_SECONDS", "0"))
+def min_interval_seconds():
+    return env_number("JEV_MIN_INTERVAL_SECONDS", "0")
 # The clock has to outlive the process. A rerun a few seconds after the last run is a
 # fresh interpreter with no memory of it, so in-process pacing fires immediately and
 # walks straight back into the limit -- which is exactly how the board retry died.
-PACE_FILE = pathlib.Path(os.environ.get("JEV_PACE_FILE", tempfile.gettempdir() + "/jev-last-request"))
+def pace_file():
+    default = f"{tempfile.gettempdir()}/jev-last-request-{os.getuid()}"
+    return pathlib.Path(os.environ.get("JEV_PACE_FILE", default))
 
 
 def _last_request_at():
     try:
-        return float(PACE_FILE.read_text())
+        return float(pace_file().read_text())
     except (OSError, ValueError):
         return None
 
 
 def pace():
-    if MIN_INTERVAL_SECONDS:
+    interval = min_interval_seconds()
+    if interval:
         previous = _last_request_at()
         # time.time(), not monotonic(): monotonic is meaningless across processes.
-        wait = 0 if previous is None else previous + MIN_INTERVAL_SECONDS - time.time()
+        wait = 0 if previous is None else previous + interval - time.time()
         if wait > 0:
             time.sleep(wait)
     try:
-        PACE_FILE.write_text(str(time.time()))
+        pace_file().write_text(str(time.time()))
     except OSError:
         pass
 
 
 def post_json(url, key, body, extra_headers=None, retries=None):
     pace()
-    retries = RETRIES if retries is None else retries
-    for attempt in range(retries):
+    # NOT retries(): the parameter of the same name shadows the module function, so
+    # `retries()` here called None and every direct-leg request died with a TypeError.
+    attempts = default_retries() if retries is None else retries
+    for attempt in range(attempts):
         try:
             headers = {"Authorization": f"Bearer {key}", **(extra_headers or {})}
             response = CLIENT.post(url, json=body, headers=headers)
         except httpx.HTTPError:
             raise ProviderError("Model connection failed; no action executed.", None) from None
-        if response.status_code in {429, 529, 503} and attempt < retries - 1:
-            time.sleep(RETRY_BASE_SECONDS * 2**attempt)
+        if response.status_code in {429, 529, 503} and attempt < attempts - 1:
+            time.sleep(retry_base_seconds() * 2**attempt)
             continue
         if response.is_error:
             # A bare status code hides the one thing that tells you what to do next -- a free-tier
@@ -135,7 +155,10 @@ def decision_legs(body):
     API's ~0.87s, but only for a burst before the free tier throttles. Free-and-fast
     first, paid-and-reliable behind it, so a run neither stalls nor pays when it need not.
     """
-    route = os.environ.get("JEV_ROUTE", "auto").strip()
+    route = os.environ.get("JEV_ROUTE", "auto").strip().lower()
+    if route not in {"auto", "gateway", "direct"}:
+        # Silently meaning "auto" is how JEV_ROUTE=Gateway bills the direct API.
+        raise Blocked(f"JEV_ROUTE={route!r} is not one of auto, gateway, direct.")
     gateway, direct = _gateway_leg(body), _direct_leg(body)
 
     if route == "gateway":
@@ -221,6 +244,10 @@ def action_space(actions):
     return elements, targets, controls
 
 
+# None is a connection failure, including a 25s ReadTimeout. A request that completed
+# server-side after the client gave up is then re-sent to the other provider and billed
+# twice -- one inference, bounded by one call. Nothing is EXECUTED twice: choose() returns
+# a single decision and Agent.command("act") consumes it once.
 FAILOVER_STATUSES = {429, 500, 502, 503, 529, None}
 
 
@@ -229,7 +256,6 @@ def post_decision(body):
     every leg, so failing over would just spend a second provider to learn the same thing.
     """
     legs = decision_legs(body)
-    last = None
     for index, leg in enumerate(legs):
         # Backing off on a leg that has another behind it is 30s spent to reach the same
         # failover. Only the last leg, which has nowhere to go, is worth waiting on.
@@ -240,8 +266,7 @@ def post_decision(body):
         except ProviderError as error:
             if error.status not in FAILOVER_STATUSES or last_leg:
                 raise
-            last = error
-    raise last
+    raise AssertionError("unreachable: the last leg always raises")  # pragma: no cover
 
 
 def choose(state, goal, history):

@@ -95,6 +95,7 @@ def test_the_agent_checks_every_action_before_executing_it():
 def test_click_only_withholds_the_text_and_select_heads(monkeypatch):
     """An unoffered operation cannot be chosen, so the run can never need a second model."""
     monkeypatch.setenv("JEV_CLICK_ONLY", "1")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")  # choose() still resolves a route
     captured = {}
 
     def fake_post(_url, _key, body, _headers=None, retries=None):
@@ -129,8 +130,8 @@ def test_click_only_refuses_the_text_helper_outright(monkeypatch):
 def test_pacing_spaces_consecutive_requests(tmp_path, monkeypatch):
     """The gap must sit on every request; two decisions inside one task are milliseconds apart."""
     slept = []
-    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
+    monkeypatch.setenv("JEV_MIN_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("JEV_PACE_FILE", str(tmp_path / "last"))
     monkeypatch.setattr(model.time, "time", lambda: 1000.0)
     monkeypatch.setattr(model.time, "sleep", slept.append)
     model.pace()
@@ -142,8 +143,8 @@ def test_pacing_spaces_consecutive_requests(tmp_path, monkeypatch):
 def test_pacing_survives_a_fresh_process(tmp_path, monkeypatch):
     """A rerun seconds later is a new interpreter; without this it walks back into the limit."""
     slept = []
-    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 60.0)
-    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
+    monkeypatch.setenv("JEV_MIN_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("JEV_PACE_FILE", str(tmp_path / "last"))
     monkeypatch.setattr(model.time, "time", lambda: 1000.0)
     monkeypatch.setattr(model.time, "sleep", slept.append)
     model.pace()
@@ -153,7 +154,51 @@ def test_pacing_survives_a_fresh_process(tmp_path, monkeypatch):
 
 
 def test_pacing_is_off_by_default(tmp_path, monkeypatch):
-    monkeypatch.setattr(model, "MIN_INTERVAL_SECONDS", 0.0)
-    monkeypatch.setattr(model, "PACE_FILE", tmp_path / "last")
+    monkeypatch.setenv("JEV_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("JEV_PACE_FILE", str(tmp_path / "last"))
     monkeypatch.setattr(model.time, "sleep", lambda _s: pytest.fail("paced with no interval set"))
     model.pace()
+
+
+@pytest.mark.parametrize("label", ["Log-out", "Sign-in", "Check-out", "force_push", "Clear  all"])
+def test_hyphens_and_underscores_do_not_defeat_the_pattern(label, monkeypatch):
+    """\\b-anchored words missed "Log-out" entirely."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked):
+        check_action(act(label))
+
+
+@pytest.mark.parametrize("label", ["Yes", "OK", "Confirm", "Proceed", "Continue", "I understand"])
+def test_confirmation_controls_are_refused(label, monkeypatch):
+    """The guard only ever sees the control that OPENS a dialog. This is the second half."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked, match="confirmation control"):
+        check_action(act(label))
+
+
+@pytest.mark.parametrize("label,role", [("button", "button"), ("", "button"), ("link", "link")])
+def test_an_unlabelled_control_is_refused(label, role, monkeypatch):
+    """snapshot.js falls back to the role name, so an icon-only button arrives as "button"."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked, match="nothing to check it against"):
+        check_action(act(label, role=role))
+
+
+@pytest.mark.parametrize("label", ["Card details", "Add card", "Watch the demo", "Star Wars"])
+def test_ordinary_product_labels_are_not_refused(label, monkeypatch):
+    """A board product has cards. Refusing "Card details" makes the guard useless on gitback."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    check_action(act(label, role="link"))
+
+
+def test_text_a_user_typed_is_not_matched(monkeypatch):
+    """A search box containing "billing" must stay clickable; its value is not a label."""
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    check_action(act("Search", kind="click", role="searchbox", current_value="billing questions"))
+
+
+@pytest.mark.parametrize("label", ["Star", "Watch", "Follow", "Update"])
+def test_ambiguous_verbs_are_refused_as_a_whole_label(label, monkeypatch):
+    monkeypatch.delenv("JEV_GUARD", raising=False)
+    with pytest.raises(Blocked, match="writes in readonly mode"):
+        check_action(act(label, role="button"))
